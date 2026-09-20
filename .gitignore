@@ -3,4 +3,7 @@ build/
 *.o
 *.a
 bin/
-external/mqtt-c/
+# O MQTT-C era ignorado, e era por isso que este repositorio NAO COMPILAVA
+# como vinha clonado: o add_subdirectory(external/mqtt-c) do CMakeLists
+# apontava para um diretorio que so existia na maquina de quem escreveu.
+# Agora e submodule de verdade — clone com --recursive.
