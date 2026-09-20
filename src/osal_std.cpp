@@ -1,3 +1,4 @@
+#include "dextro-iot/osal_std.h"
 #include <dextro-iot/osal.h>
 #include <thread>
 #include <mutex>
@@ -42,6 +43,10 @@ public:
         ).count();
     }
 };
+
+std::shared_ptr<IOSAL> make_std_osal() {
+    return std::make_shared<StdOSAL>();
+}
 
 } // namespace iot
 } // namespace dextro

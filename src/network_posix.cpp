@@ -1,3 +1,4 @@
+#include "dextro-iot/network_posix.h"
 #include <dextro-iot/network.h>
 #include <sys/socket.h>
 #include <netdb.h>
@@ -65,6 +66,10 @@ public:
         return std::make_unique<PosixSocket>(); 
     }
 };
+
+std::shared_ptr<INetworkProvider> make_posix_network() {
+    return std::make_shared<PosixNetworkProvider>();
+}
 
 } // namespace iot
 } // namespace dextro
