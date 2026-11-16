@@ -1,0 +1,109 @@
+#pragma once
+
+#include <nlohmann/json.hpp>
+
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
+
+/// O que as device-procedures genéricas precisam da aplicação, como interfaces.
+///
+/// Cada op recebe só os ports de que precisa, na construção. A aplicação
+/// implementa (status, settings, sessão) ou usa a implementação da biblioteca
+/// (`certificates/certificate_store.hpp`, OpenSSL); os testes passam fakes. É
+/// essa fronteira que deixa as ops sem arquivo, sem relógio e sem MQTT.
+///
+/// **Chamados da thread que roda o `Client::tick()`.** Toda implementação tem
+/// que ser segura para isso.
+///
+/// Origem: `src/drivers/iot/procedures/ports.hpp` do ssat-traffic-controller.
+/// Os ports do controlador de trânsito (anéis, programação, semente de teste)
+/// e o spool do OTA ficaram lá: são da aplicação.
+namespace dextro::iot::procedures {
+
+using Json = nlohmann::json;
+
+/// `get-status`: um bloco por seção.
+class StatusSource {
+public:
+    virtual ~StatusSource() = default;
+
+    /// As seções que esta fonte conhece, na ordem em que saem em `"all"`.
+    virtual std::vector<std::string> sections() const = 0;
+
+    /// Preenche `out` com a seção. `false` = seção desconhecida.
+    virtual bool fill(std::string_view section, Json& out) const = 0;
+};
+
+/// Um item rejeitado de `settings-write`.
+class Rejection {
+public:
+    std::string ref;
+    std::string reason;
+};
+
+/// `settings-read` / `settings-write` sobre a coleção de settings do device
+/// (contracts.md A.1.1 `SettingsCollection`; SPEC do dextrolabs-device §8).
+class SettingsStore {
+public:
+    virtual ~SettingsStore() = default;
+
+    /// A versão aplicada, 0 quando nunca houve `settings-write`.
+    virtual std::int64_t version() const = 0;
+
+    /// A coleção aplicada, filtrada por `refs` (vazio = todas). Um ref que não
+    /// casa com nada é ignorado — `settings-read` não tem como recusar item.
+    virtual Json read(const std::vector<std::string>& refs) const = 0;
+
+    /// Aplica a coleção e grava `version`. Item que não pode ser aplicado vai
+    /// para `rejected`; o resto é aplicado. Devolve `false` quando não deu nem
+    /// para persistir — e aí a versão NÃO avança. `session_affected` = algum
+    /// item mudou o broker ou a credencial: a sessão será reaberta.
+    virtual bool apply(std::int64_t version, const Json& settings, std::vector<Rejection>& rejected,
+                       bool& session_affected) = 0;
+};
+
+/// `certificate-request` / `certificate-install` (SPEC do dextrolabs-device §3.5).
+class CertificateStore {
+public:
+    enum class Result {
+        Ok,
+        KeyGeneration,  ///< não deu para gerar a chave ou a CSR
+        Mismatch,       ///< o certificado não casa com nenhuma chave pendente
+        Invalid,        ///< PEM ilegível
+        Storage,        ///< não deu para gravar
+    };
+
+    virtual ~CertificateStore() = default;
+
+    /// Gera um par novo e devolve a CSR em PEM. O mesmo `request_id` repetido
+    /// devolve a MESMA CSR — é reentrega, não pedido novo (A.4.7).
+    virtual Result request_csr(std::string_view request_id, std::string& csr_pem) = 0;
+
+    /// Instala o certificado emitido para uma chave pendente e devolve o
+    /// SHA-256 do DER, em hex.
+    virtual Result install(std::string_view cert_pem, std::string_view chain_pem,
+                           std::string& fingerprint) = 0;
+};
+
+/// O que uma op pode pedir à sessão com o broker. Assíncrono de propósito:
+/// quem executa é a aplicação, DEPOIS de a resposta ser publicada — um
+/// `certificate-install` que reconectasse antes de responder deixaria o
+/// backend esperando um reply que nunca sai.
+class SessionControl {
+public:
+    virtual ~SessionControl() = default;
+
+    /// `outbox-notification`: drenar a outbox na próxima volta.
+    virtual void request_outbox_drain() = 0;
+
+    /// Reabrir a sessão com a configuração e o certificado atuais.
+    virtual void request_reconnect() = 0;
+
+    /// `true` enquanto a sessão está autenticada pelo certificado de fábrica.
+    /// Nesse escopo só as ops marcadas `bootstrap` são atendidas (A.4).
+    virtual bool bootstrap_scope() const = 0;
+};
+
+}  // namespace dextro::iot::procedures

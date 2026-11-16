@@ -1,71 +1,176 @@
-#include <dextro-iot/client.h>
-#include <iostream>
+// Exemplo mínimo: um device que conecta com mTLS, atende as device-procedures
+// genéricas mais uma op do tipo, manda keepalive e drena eventos.
+//
+//   iot-example <host> <SN> <ca.pem> <cert.pem> <key.pem>
+//
+// A fila de eventos aqui é em memória só para o exemplo caber num arquivo: num
+// device de verdade ela é durável (uma tabela do MoleculaEntity numa aplicação
+// C++ da Dextro), com o `seq` persistido entre reboots.
+#include <dextro-iot/certificates/certificate_store.hpp>
+#include <dextro-iot/clock.hpp>
+#include <dextro-iot/event_dispatcher.hpp>
+#include <dextro-iot/iot_client.hpp>
+#include <dextro-iot/keepalive.hpp>
+#include <dextro-iot/log.hpp>
+#include <dextro-iot/procedures/ops/list_procedures.hpp>
+#include <dextro-iot/procedures/procedure_table.hpp>
+#include <dextro-iot/session/link_monitor.hpp>
+
+#include <poll.h>
+
+#include <csignal>
+#include <cstdio>
+#include <map>
 #include <memory>
-#include <mqtt.h>
-#include <sys/socket.h>
-#include <netdb.h>
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <cstring>
 
-int open_socket(const char* addr, const char* port) {
-    struct addrinfo hints = {0}, *addrs;
-    hints.ai_family = AF_INET; // Força IPv4
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_protocol = IPPROTO_TCP;
-    if (getaddrinfo(addr, port, &hints, &addrs) != 0) return -1;
-    int fd = socket(addrs->ai_family, addrs->ai_socktype, addrs->ai_protocol);
-    if (fd < 0) return -1;
-    if (connect(fd, addrs->ai_addr, addrs->ai_addrlen) < 0) {
-        close(fd);
-        return -1;
+namespace iot = dextro::iot;
+namespace procs = dextro::iot::procedures;
+
+namespace {
+
+volatile std::sig_atomic_t g_stop = 0;
+
+/// Uma op do tipo de device: `{"door": 1..4}` → abre a porta.
+class OpenDoor final : public procs::Procedure {
+public:
+    std::optional<procs::Reply> validate(const procs::Json& payload) const override
+    {
+        if (auto refused = procs::only_keys(payload, {"door"})) {
+            return refused;
+        }
+        if (auto refused = procs::require(payload, "door")) {
+            return refused;
+        }
+        return procs::integer_field(payload, "door", 1);
     }
-    freeaddrinfo(addrs);
-    return fd;
-}
+    procs::Reply execute(const procs::Request& request) override
+    {
+        return procs::Reply::ok({{"opened", request.payload["door"]}});
+    }
+};
 
-int main(int argc, char** argv) {
-    if (argc < 3) return 1;
+/// A sessão vista pelas ops: aqui, só o pedido de reconexão.
+class Control final : public procs::SessionControl {
+public:
+    bool reconnect = false;
+    void request_outbox_drain() override {}
+    void request_reconnect() override { reconnect = true; }
+    bool bootstrap_scope() const override { return false; }
+};
 
-    const char* host = argv[1];
-    const char* port = argv[2];
+/// SÓ PARA O EXEMPLO: uma fila em memória perde tudo no reboot.
+class MemoryEvents final : public iot::EventStore {
+public:
+    std::map<std::int64_t, iot::StoredEvent> rows;
+    std::int64_t next_seq = 1;
 
-    int sockfd = open_socket(host, port);
-    if (sockfd < 0) {
-        std::cerr << "❌ Erro ao abrir socket" << std::endl;
+    std::vector<iot::StoredEvent> due(std::int64_t, std::size_t limit) override
+    {
+        std::vector<iot::StoredEvent> out;
+        for (const auto& kv : rows) {
+            if (out.size() == limit) {
+                break;
+            }
+            out.push_back(kv.second);
+        }
+        return out;
+    }
+    std::size_t acknowledge(std::int64_t ack, const std::vector<std::int64_t>& seqs) override
+    {
+        std::size_t n = 0;
+        for (auto it = rows.begin(); it != rows.end();) {
+            bool listed = false;
+            for (auto s : seqs) {
+                listed = listed || s == it->first;
+            }
+            if (it->first <= ack || listed) {
+                it = rows.erase(it);
+                ++n;
+            } else {
+                ++it;
+            }
+        }
+        return n;
+    }
+    void reject(std::int64_t seq, std::string_view) override { rows.erase(seq); }
+    void reschedule(const std::vector<std::int64_t>&, std::int64_t, std::string_view, bool) override {}
+    std::optional<std::int64_t> next_touch() override { return std::nullopt; }
+};
+
+}  // namespace
+
+int main(int argc, char** argv)
+{
+    if (argc != 6) {
+        std::fprintf(stderr, "uso: %s <host> <SN> <ca.pem> <cert.pem> <key.pem>\n", argv[0]);
+        return 2;
+    }
+    std::signal(SIGINT, [](int) { g_stop = 1; });
+    iot::log::set_level(iot::log::Level::Info);
+
+    iot::Config config;
+    config.host = argv[1];
+    config.serial = iot::canonical_serial(argv[2]);
+    config.ca_cert = argv[3];
+    config.client_cert = argv[4];
+    config.client_key = argv[5];
+
+    procs::ProcedureTable table;
+    Control control;
+    table.add({"list-procedures", 1, false, 30000, false},
+              std::make_unique<procs::ListProcedures>(table, "example-device", 1));
+    table.add({"open-door", 1, false, 15000, false}, std::make_unique<OpenDoor>());
+
+    iot::Client client;
+    client.bind(table, control);
+
+    const std::int64_t started = iot::clock::monotonic_ms();
+    iot::Keepalive keepalive(client,
+                             [&] {
+                                 iot::Keepalive::Status s;
+                                 s.fw_version = "0.0.1";
+                                 s.cert_fingerprint = iot::certificate_fingerprint(config.client_cert);
+                                 return s;
+                             },
+                             started);
+
+    MemoryEvents events;
+    iot::EventDispatcher dispatcher(client, events);
+    iot::StoredEvent boot;
+    boot.seq = events.next_seq++;
+    boot.code = "power-up";
+    boot.args = "{}";
+    boot.occurred_ms = iot::clock::wall_ms();
+    events.rows[boot.seq] = boot;
+
+    iot::session::LinkMonitor network;
+    (void)network.open();
+
+    if (!client.start(config, started)) {
         return 1;
     }
-
-    struct mqtt_client client;
-    uint8_t sendbuf[2048], recvbuf[2048];
-    mqtt_init(&client, sockfd, sendbuf, sizeof(sendbuf), recvbuf, sizeof(recvbuf), NULL);
-    
-    mqtt_connect(&client, "DEV-NATIVE-001", NULL, NULL, 0, NULL, NULL, 0, 400);
-    
-    // Loop de Handshake
-    for(int i=0; i<50; ++i) {
-        mqtt_sync(&client);
-        if (client.error != MQTT_OK) {
-            std::cerr << "❌ Erro MQTT durante handshake: " << mqtt_error_str(client.error) << std::endl;
-            break;
+    while (g_stop == 0) {
+        const std::int64_t now = iot::clock::monotonic_ms();
+        int wait = client.tick(now);
+        keepalive.tick(now);
+        dispatcher.tick(now);
+        if (control.reconnect) {
+            control.reconnect = false;
+            client.restart(now);
         }
-        usleep(100000); // 100ms
-    }
+        for (std::int64_t due : {keepalive.next_in(now), dispatcher.next_in(now)}) {
+            if (due >= 0 && due < wait) {
+                wait = static_cast<int>(due);
+            }
+        }
 
-    if (client.error == MQTT_OK) {
-        std::cout << "✅ Conectado (Handshake Finalizado)" << std::endl;
-
-        const char* topic = "test/native";
-        const char* payload = "{\"status\":\"alive\"}";
-        mqtt_publish(&client, topic, payload, strlen(payload), MQTT_PUBLISH_QOS_0);
-
-        std::cout << "💓 Heartbeat enviado para test/native" << std::endl;
-
-        for(int i=0; i<30; ++i) {
-            mqtt_sync(&client);
-            usleep(100000);
+        pollfd fds[2] = {{client.fd(), static_cast<short>(POLLIN | (client.wants_write() ? POLLOUT : 0)), 0},
+                         {network.fd(), POLLIN, 0}};
+        (void)::poll(fds, 2, wait);
+        if ((fds[1].revents & POLLIN) != 0 && network.drain()) {
+            client.network_changed(iot::clock::monotonic_ms());
         }
     }
-
+    client.stop(iot::clock::monotonic_ms());
     return 0;
 }
