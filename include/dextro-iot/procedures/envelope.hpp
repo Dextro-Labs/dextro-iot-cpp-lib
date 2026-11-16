@@ -37,8 +37,10 @@ namespace dextro::iot::procedures {
 /// `metadata.v` que este device fala.
 constexpr std::string_view kProtocolVersion = "0.5";
 
-/// TTL de request RPC no device (spec §8).
-constexpr std::int64_t kRequestTtlMs = 60000;
+/// TTL de request RPC no device: 120 s no inbound (dextrolabs-device SPEC.md
+/// §4.2, "request expirado (TTL de 120s no inbound) → 504 TTL_EXPIRED"). O
+/// ssat-trafficd usa 60 s; a lib segue a spec.
+constexpr std::int64_t kRequestTtlMs = 120000;
 /// `CLOCK_SKEW_TOL` (spec §2).
 constexpr std::int64_t kClockSkewMs = 5000;
 

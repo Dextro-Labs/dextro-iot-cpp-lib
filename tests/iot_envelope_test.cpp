@@ -149,7 +149,7 @@ TEST(IotEnvelopeTtl, PedidoDoFuturoAlemDaToleranciaEClockSkew)
 TEST(IotEnvelopeTtl, TimestampEmSegundosENormalizado)
 {
     EXPECT_FALSE(parse_request(at(kNow / 1000 - 2), kSerial, synced(kNow)).refusal.has_value());
-    EXPECT_TRUE(parse_request(at(kNow / 1000 - 120), kSerial, synced(kNow)).refusal.has_value());
+    EXPECT_TRUE(parse_request(at(kNow / 1000 - kRequestTtlMs / 1000 - 60), kSerial, synced(kNow)).refusal.has_value());
 }
 
 TEST(IotEnvelopeTtl, RelogioSemSincroniaDesligaOTtl)
