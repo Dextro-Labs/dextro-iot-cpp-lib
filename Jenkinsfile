@@ -7,4 +7,6 @@
 // GoogleTest vem do sistema ou por FetchContent.
 @Library('dextro-pipeline') _
 
-dextroLib(stack: 'cmake', pre: 'git submodule update --init --recursive', cmake: '-D BUILD_TESTS=ON -D BUILD_EXAMPLES=ON')
+// O stack cmake do dextroLib instala só cmake/ninja/build-essential/git
+// (dextro-infra dextroLib.groovy): o OpenSSL 3 de desenvolvimento vem pelo apt.
+dextroLib(stack: 'cmake', apt: 'libssl-dev', pre: 'git submodule update --init --recursive', cmake: '-D BUILD_TESTS=ON -D BUILD_EXAMPLES=ON')
