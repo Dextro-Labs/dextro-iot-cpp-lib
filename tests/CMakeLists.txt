@@ -25,7 +25,21 @@ add_executable(dextro_iot_tests
     # bancada: mTLS, nome do servidor, recusas e SIGPIPE.
     iot_tls_transport_test.cpp
     keepalive_test.cpp
-    event_dispatcher_test.cpp)
+    event_dispatcher_test.cpp
+    # ota-notification, o inbox e o chaveiro por arquivo.
+    iot_ota_notification_test.cpp
+    credential_policy_test.cpp
+    # O token dxd_ e o sd_notify contra um socket AF_UNIX de verdade.
+    device_support_test.cpp)
+
+# O módulo ota: a Engine contra portas falsas e as peças (rauc/systemctl de
+# mentira em shell, sem rede).
+if(DEXTRO_IOT_WITH_OTA)
+    target_sources(dextro_iot_tests PRIVATE
+        ota_engine_test.cpp
+        ota_parts_test.cpp)
+    target_link_libraries(dextro_iot_tests PRIVATE dextro-iot-ota)
+endif()
 
 # Os testes veem os internos: o da sessão inclui <mqtt.h>.
 target_link_libraries(dextro_iot_tests PRIVATE

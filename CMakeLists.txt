@@ -16,6 +16,10 @@ endif()
 option(BUILD_TESTS "Build the unit tests (GoogleTest)" ${DEXTRO_IOT_TOP_LEVEL})
 option(BUILD_EXAMPLES "Build the example application" ${DEXTRO_IOT_TOP_LEVEL})
 option(DEXTRO_IOT_WERROR "Treat warnings as errors" OFF)
+# O módulo `ota` (dextro::iot-ota): Engine, CurlDownloader, RAUC. Exige a
+# libcurl; ligado por padrão quando ela é achada.
+find_package(CURL QUIET)
+option(DEXTRO_IOT_WITH_OTA "Build the OTA module (needs libcurl)" ${CURL_FOUND})
 
 # --------------------------------------------------------------- avisos ---
 # Alvo de interface em vez de flags globais: o MQTT-C e o nlohmann não são
@@ -97,13 +101,17 @@ set_target_properties(dextro_iot_mqttc PROPERTIES C_STANDARD 99 POSITION_INDEPEN
 add_library(dextro-iot-cpp STATIC
     src/atomic_file.cpp
     src/clock.cpp
+    src/credential_policy.cpp
+    src/device_token.cpp
     src/event_dispatcher.cpp
     src/iot_client.cpp
     src/keepalive.cpp
     src/log.cpp
+    src/systemd_notify.cpp
     src/certificates/certificate_store.cpp
     src/procedures/envelope.cpp
     src/procedures/procedure.cpp
+    src/procedures/ota_adapters.cpp
     src/procedures/procedure_table.cpp
     src/procedures/remote_call.cpp
     src/procedures/rescode.cpp
@@ -111,6 +119,7 @@ add_library(dextro-iot-cpp STATIC
     src/procedures/ops/certificate_request.cpp
     src/procedures/ops/get_status.cpp
     src/procedures/ops/list_procedures.cpp
+    src/procedures/ops/ota_notification.cpp
     src/procedures/ops/outbox_notification.cpp
     src/procedures/ops/settings_read.cpp
     src/procedures/ops/settings_write.cpp
@@ -132,6 +141,34 @@ endif()
 
 include(GNUInstallDirs)
 install(TARGETS dextro-iot-cpp dextro_iot_mqttc ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+
+# ------------------------------------------------------------------- ota ---
+# Alvo separado: o agente de OTA pode ser um processo sem MQTT (como o
+# ssat-otad), e quem não atualiza nada não precisa da libcurl no link.
+if(DEXTRO_IOT_WITH_OTA)
+    if(NOT CURL_FOUND)
+        message(FATAL_ERROR
+            "DEXTRO_IOT_WITH_OTA=ON e a libcurl não foi achada.\n"
+            "  apt install libcurl4-openssl-dev   (ou -DDEXTRO_IOT_WITH_OTA=OFF)")
+    endif()
+    add_library(dextro-iot-ota STATIC
+        src/ota/curl_downloader.cpp
+        src/ota/engine.cpp
+        src/ota/fs.cpp
+        src/ota/job.cpp
+        src/ota/linux_platform.cpp
+        src/ota/manifest.cpp
+        src/ota/rauc.cpp
+        src/ota/sha256.cpp
+        src/ota/signature.cpp)
+    add_library(dextro::iot-ota ALIAS dextro-iot-ota)
+    set_target_properties(dextro-iot-ota PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    target_link_libraries(dextro-iot-ota
+        PUBLIC dextro-iot-cpp
+        PRIVATE CURL::libcurl OpenSSL::Crypto dextro_iot_warnings)
+    install(TARGETS dextro-iot-ota ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+endif()
+message(STATUS "dextro-iot: módulo ota ${DEXTRO_IOT_WITH_OTA}")
 install(DIRECTORY include/dextro-iot DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 if(BUILD_EXAMPLES)
