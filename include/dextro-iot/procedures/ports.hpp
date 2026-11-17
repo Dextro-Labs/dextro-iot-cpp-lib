@@ -3,6 +3,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -19,7 +20,9 @@
 ///
 /// Origem: `src/drivers/iot/procedures/ports.hpp` do ssat-traffic-controller.
 /// Os ports do controlador de trânsito (anéis, programação, semente de teste)
-/// e o spool do OTA ficaram lá: são da aplicação.
+/// ficaram lá: são da aplicação. O `OtaSpool` de lá virou três portas aqui
+/// (`OtaSpool`, `Keyring`, `InstalledVersion`): no SSAT as três respostas
+/// vinham de um objeto só, e em outro device vêm de lugares diferentes.
 namespace dextro::iot::procedures {
 
 using Json = nlohmann::json;
@@ -85,6 +88,48 @@ public:
     /// SHA-256 do DER, em hex.
     virtual Result install(std::string_view cert_pem, std::string_view chain_pem,
                            std::string& fingerprint) = 0;
+};
+
+/// `ota-notification` (contracts.md A.4.3): para onde vai o manifesto aceito.
+///
+/// A op não baixa nem instala: confere o que dá para conferir sem o arquivo e
+/// entrega. Quem baixa é o `ota::Engine` (módulo `ota`, outra thread ou outro
+/// processo), ou o agente que a aplicação tiver. `InboxOtaSpool`
+/// (`procedures/ota_adapters.hpp`) é a entrega por arquivo no inbox do
+/// `Engine`.
+class OtaSpool {
+public:
+    virtual ~OtaSpool() = default;
+
+    /// Grava o manifesto (o payload da op, como veio) para o agente. A mesma
+    /// `campaignItemId` de novo sobrescreve: reentrega é idempotente. `false`
+    /// = não gravou (a op responde 500 `STORAGE` e o backend tenta de novo).
+    virtual bool enqueue(const Json& manifest) = 0;
+};
+
+/// As chaves ed25519 em que o device confia para os artefatos que não se
+/// assinam sozinhos (`signingKeyId` do `ota-notification`).
+class Keyring {
+public:
+    virtual ~Keyring() = default;
+
+    /// `true` quando `key_id` é uma chave conhecida. A op só pergunta com id
+    /// não vazio.
+    virtual bool known(std::string_view key_id) const = 0;
+};
+
+/// A versão instalada do que o manifesto atualiza, para o `alreadyInstalled`
+/// (200 sem entregar).
+class InstalledVersion {
+public:
+    virtual ~InstalledVersion() = default;
+
+    /// A versão hoje instalada do artefato que `manifest` descreve
+    /// (`artifactFormat`, `artifactName`), ou `nullopt` quando este processo
+    /// não sabe — e então a comparação fica com o agente. Ex.: a versão da
+    /// IMAGEM para o `raucb`; `nullopt` para o firmware de uma placa que só o
+    /// agente consulta.
+    virtual std::optional<std::string> installed_version(const Json& manifest) const = 0;
 };
 
 /// O que uma op pode pedir à sessão com o broker. Assíncrono de propósito:
