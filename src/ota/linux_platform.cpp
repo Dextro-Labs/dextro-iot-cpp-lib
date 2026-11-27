@@ -11,11 +11,15 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
+#include <thread>
 
 extern char** environ;
 
@@ -63,9 +67,22 @@ std::vector<char*> child_environment()
     return env;
 }
 
+/// O SIGKILL só vale quando o filho sai de um sleep de I/O (estado D): quem
+/// espera por ele é uma thread à parte, para o chamador não ficar preso e o
+/// filho não virar zumbi (waitpid(2)).
+void reap_later(pid_t pid)
+{
+    std::thread([pid] {
+        int status = 0;
+        while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+        }
+    }).detach();
+}
+
 }  // namespace
 
-int run_command(const std::vector<std::string>& argv, std::string& output, const KeepGoing& tick)
+int run_command(const std::vector<std::string>& argv, std::string& output, const KeepGoing& tick,
+                std::int64_t timeout_ms)
 {
     output.clear();
     if (argv.empty()) {
@@ -99,10 +116,23 @@ int run_command(const std::vector<std::string>& argv, std::string& output, const
         return -1;
     }
 
+    const auto started = std::chrono::steady_clock::now();
+    bool timed_out = false;
     char buf[1024];
     for (;;) {
+        int wait_ms = 1000;
+        if (timeout_ms > 0) {
+            const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   std::chrono::steady_clock::now() - started)
+                                   .count();
+            if (spent >= timeout_ms) {
+                timed_out = true;
+                break;
+            }
+            wait_ms = static_cast<int>(std::min<std::int64_t>(wait_ms, timeout_ms - spent));
+        }
         pollfd p{pipefd[0], POLLIN, 0};
-        const int ready = ::poll(&p, 1, 1000);
+        const int ready = ::poll(&p, 1, wait_ms);
         if (ready > 0) {
             const ssize_t n = ::read(pipefd[0], buf, sizeof buf);
             if (n > 0) {
@@ -124,6 +154,12 @@ int run_command(const std::vector<std::string>& argv, std::string& output, const
         }
     }
     ::close(pipefd[0]);
+    if (timed_out) {
+        ::kill(pid, SIGKILL);
+        reap_later(pid);
+        output += "\n(" + argv[0] + ": prazo de " + std::to_string(timeout_ms) + " ms esgotado)";
+        return kRunTimedOut;
+    }
     int status = 0;
     while (::waitpid(pid, &status, 0) < 0) {
         if (errno != EINTR) {
