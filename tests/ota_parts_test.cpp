@@ -307,6 +307,95 @@ TEST(OtaPlataforma, RaucInstallerDizOMotivoDaUltimaLinha)
     fs::remove_file(rauc);
 }
 
+// `rauc status --detailed --output-format=json` da estação 0014FFD0000D em
+// 26/11/2026, depois da OTA-00095 (slot A escrito, B rodando).
+const char* kRaucJson =
+    R"({"compatible":"allprint-orangepi-3b-v2","variant":"","booted":"B","boot_primary":"rootfs.0",)"
+    R"("slots":[{"rootfs.1":{"class":"rootfs","device":"/dev/disk/by-partlabel/rootfsB","type":"ext4",)"
+    R"("bootname":"B","state":"booted","parent":null,"mountpoint":null,"boot_status":"good",)"
+    R"("slot_status":{"bundle":{"compatible":"allprint-orangepi-3b-v2","version":"5.0.21-20261125003309",)"
+    R"("build":"20261125003309"},"installed":{"timestamp":"2026-11-25T02:26:35Z","count":5},)"
+    R"("status":"ok"}}},{"rootfs.0":{"class":"rootfs","device":"/dev/disk/by-partlabel/rootfsA",)"
+    R"("type":"ext4","bootname":"A","state":"inactive","parent":null,"mountpoint":null,)"
+    R"("boot_status":"good","slot_status":{"bundle":{"compatible":"allprint-orangepi-3b-v2",)"
+    R"("version":"5.0.21-20261125234537","build":"20261125234537"},)"
+    R"("installed":{"timestamp":"2026-11-26T10:04:10Z","count":5},"status":"ok"}}}],)"
+    R"("artifact-repositories":[]})";
+
+TEST(OtaRauc, SlotDoJsonDoRaucStatus)
+{
+    const auto a = parse_rauc_slot(kRaucJson, "a");
+    ASSERT_TRUE(a.has_value());
+    EXPECT_EQ(a->status, "ok");
+    EXPECT_EQ(a->build, "20261125234537");
+    EXPECT_EQ(a->installed_ms, 1795687450000LL);  // 2026-11-26T10:04:10Z
+    EXPECT_TRUE(a->primary);
+
+    const auto b = parse_rauc_slot(kRaucJson, "B");
+    ASSERT_TRUE(b.has_value());
+    EXPECT_FALSE(b->primary);
+    EXPECT_EQ(b->build, "20261125003309");
+
+    EXPECT_FALSE(parse_rauc_slot(kRaucJson, "C").has_value());
+    EXPECT_FALSE(parse_rauc_slot("Already processing a different method", "A").has_value());
+    EXPECT_FALSE(parse_rauc_slot(R"({"slots":[{"rootfs.0":{"bootname":"A"}}]})", "A").has_value())
+        << "slot sem slot_status (nunca escrito)";
+}
+
+TEST(OtaRauc, DaemonPeloBusctl)
+{
+    auto d = parse_rauc_daemon("s \"idle\"\ns \"\"\n");
+    EXPECT_EQ(d.operation, RaucDaemon::Operation::Idle);
+    EXPECT_EQ(d.last_error, "");
+
+    d = parse_rauc_daemon("s \"installing\"\ns \"Installation error: \\\"x\\\" bad\"\n");
+    EXPECT_EQ(d.operation, RaucDaemon::Operation::Busy);
+    EXPECT_EQ(d.last_error, "Installation error: \"x\" bad");
+
+    EXPECT_EQ(parse_rauc_daemon("").operation, RaucDaemon::Operation::Unknown);
+    EXPECT_EQ(parse_rauc_daemon("Failed to get property: no such service").operation,
+              RaucDaemon::Operation::Unknown);
+}
+
+TEST(OtaPlataforma, RaucInstallerPerguntaAoDaemonEAoSlot)
+{
+    const std::string json_file = tmp("rauc-json");
+    std::ofstream(json_file) << kRaucJson;
+    const std::string rauc = fake_tool(
+        "rauc-detailed", "[ \"$1\" = status ] && [ \"$2\" = --detailed ] && "
+                         "[ \"$3\" = --output-format=json ] && cat '" + json_file +
+                             "' && exit 0\nexit 1");
+    const std::string busctl = fake_tool(
+        "busctl", "[ \"$1\" = --system ] && [ \"$2\" = get-property ] && "
+                  "[ \"$3\" = de.pengutronix.rauc ] && [ \"$6\" = Operation ] && "
+                  "[ \"$7\" = LastError ] && printf 's \"idle\"\\ns \"\"\\n' && exit 0\nexit 1");
+    RaucInstaller installer(rauc, busctl);
+    EXPECT_EQ(installer.daemon().operation, RaucDaemon::Operation::Idle);
+    const auto a = installer.slot("A");
+    ASSERT_TRUE(a.has_value());
+    EXPECT_TRUE(a->primary);
+
+    RaucInstaller sem(rauc, "/caminho/que/nao/existe/busctl");
+    EXPECT_EQ(sem.daemon().operation, RaucDaemon::Operation::Unknown);
+    for (const std::string& f : {json_file, rauc, busctl}) {
+        fs::remove_file(f);
+    }
+}
+
+TEST(OtaPlataforma, RaucInstallerLevaOMotivoAntesDoDBusError)
+{
+    const std::string rauc = fake_tool(
+        "rauc-dbus", "echo 'Failed to contact rauc service: Already processing a different method' >&2\n"
+                     "echo 'D-Bus error while installing `/data/x.raucb`' >&2\nexit 2");
+    RaucInstaller installer(rauc);
+    std::string message;
+    EXPECT_FALSE(installer.install("/data/x.raucb", message, {}));
+    EXPECT_NE(message.find("saiu com 2"), std::string::npos);
+    EXPECT_NE(message.find("Already processing"), std::string::npos);
+    EXPECT_NE(message.find("D-Bus error"), std::string::npos);
+    fs::remove_file(rauc);
+}
+
 TEST(OtaPlataforma, FilhoNaoHerdaOSocketDeNotificacaoDoSystemd)
 {
     // Sob o systemd o agente tem NOTIFY_SOCKET; o rauc/systemctl que ele chama
