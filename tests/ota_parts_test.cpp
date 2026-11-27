@@ -18,6 +18,8 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -415,6 +417,28 @@ TEST(OtaPlataforma, FilhoNaoHerdaOSocketDeNotificacaoDoSystemd)
     ::unsetenv("WATCHDOG_USEC");
     ::unsetenv("DEXTRO_OTA_TESTE");
     EXPECT_EQ(run_command({"/caminho/que/nao/existe"}, out), -1);
+}
+
+TEST(OtaPlataforma, RunCommandComPrazoMataOFilhoESegue)
+{
+    // O `systemctl` preso no SD saturado (0014FFD0000D, 26/11/2026): quem
+    // chamou segue no prazo, sem esperar o filho.
+    std::string out;
+    const auto t0 = std::chrono::steady_clock::now();
+    EXPECT_EQ(run_command({"sh", "-c", "echo comecou; sleep 30"}, out, {}, 300), kRunTimedOut);
+    const auto spent = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - t0)
+                           .count();
+    EXPECT_LT(spent, 2000);
+    EXPECT_NE(out.find("comecou"), std::string::npos);
+    EXPECT_NE(out.find("prazo de 300 ms esgotado"), std::string::npos);
+}
+
+TEST(OtaPlataforma, RunCommandComPrazoQueTerminaAntesDevolveOCodigo)
+{
+    std::string out;
+    EXPECT_EQ(run_command({"sh", "-c", "echo ok; exit 3"}, out, {}, 5000), 3);
+    EXPECT_EQ(out, "ok\n");
 }
 
 TEST(OtaDownload, SoHttpsENaoTocaNaRede)

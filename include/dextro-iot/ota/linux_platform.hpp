@@ -3,6 +3,7 @@
 #include <dextro-iot/device_token.hpp>
 #include <dextro-iot/ota/ports.hpp>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -34,13 +35,22 @@ namespace dextro::iot::ota {
 
 /// Roda `argv` e espera, chamando `tick` a cada segundo (watchdog). `output`
 /// recebe o fim do stdout+stderr (até 4 KiB). Devolve o código de saída, ou
-/// -1 se nem rodou.
+/// -1 se nem rodou, ou `kRunTimedOut` se passou de `timeout_ms` (> 0): o
+/// filho leva SIGKILL e quem chamou segue na hora — um filho preso em I/O
+/// (estado D) é recolhido por uma thread à parte, sem segurar o chamador.
+///
+/// O laço principal de um daemon com watchdog NUNCA chama sem prazo: sob o
+/// cartão SD saturado um `systemctl` levou mais de 60 s para responder e o
+/// watchdog matou o agente no meio de um `rauc install` (0014FFD0000D,
+/// 26/11/2026).
 ///
 /// O filho NÃO herda `NOTIFY_SOCKET`/`WATCHDOG_*`/`LISTEN_*`: o `rauc` e o
 /// `systemctl` que falam sd_notify cairiam no socket deste processo — e um
 /// filho mandando `WATCHDOG=1` alimentaria o watchdog no lugar dele.
+constexpr int kRunTimedOut = -2;
+
 int run_command(const std::vector<std::string>& argv, std::string& output,
-                const KeepGoing& tick = {});
+                const KeepGoing& tick = {}, std::int64_t timeout_ms = 0);
 
 class LinuxPlatform final : public Platform {
 public:
