@@ -39,7 +39,7 @@ Com `DEXTRO_IOT_WITH_OTA` (alvo `dextro::iot-ota`):
 |---|---|---|
 | `ota::Engine` | `dextro-iot/ota/engine.hpp` | A máquina de estados: inbox → `applyAfter` → download → tamanho + sha256 + ed25519 → instalação → reboot → confirmação/rollback, estado em disco, idempotente por `campaignItemId`. **Bloqueia**: fora do laço do `Client` |
 | `ota::ArtifactHandler` | `dextro-iot/ota/artifact_handler.hpp` | Um formato de artefato: `accept()`, `check()`, `install()` (com ou sem reboot) |
-| `ota::RaucHandler`, `RaucInstaller` | `dextro-iot/ota/rauc.hpp` | O `raucb`: `rauc install` no slot inativo, reboot, mark-good; leitura de `rauc status --output-format=shell` |
+| `ota::RaucHandler`, `RaucInstaller` | `dextro-iot/ota/rauc.hpp` | O `raucb`: `rauc install` no slot inativo, reboot, mark-good; leitura de `rauc status --output-format=shell`. O resultado da instalação é o do `rauc.service` (`Operation`/`LastError` pelo `busctl`, o slot pelo `rauc status --detailed --output-format=json`), não a saída do cliente: com o daemon ocupado espera, e um cliente que caiu com o slot escrito segue para o reboot |
 | `ota::LinuxPlatform` | `dextro-iot/ota/linux_platform.hpp` | Slot da cmdline (`rauc.slot=`, configurável) ou do `rauc status`, "slot bad" pelo `rauc status`, unit de mark-good, reboot, espaço livre, token |
 | `ota::CurlDownloader` | `dextro-iot/ota/curl_downloader.hpp` | HTTPS com `device-auth`, retomada por `Range`, sem redirecionamento |
 | `ota::EventSink` | `dextro-iot/ota/event_sink.hpp` | A porta da trilha `ota-*` (eventos 40..49): a aplicação grava na fila dela |

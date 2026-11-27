@@ -18,6 +18,8 @@
 
 #include <deque>
 #include <fstream>
+#include <functional>
+#include <optional>
 
 #ifndef DEXTRO_IOT_TEST_DIR
 #error "DEXTRO_IOT_TEST_DIR não definido"
@@ -71,21 +73,57 @@ public:
     }
 };
 
+/// O RAUC: o cliente (`install`), o daemon (`Operation`/`LastError`) e o
+/// registro do slot alvo. Por padrão o daemon escreve o slot quando o cliente
+/// termina bem, como o rauc.service de verdade.
 class FakeInstaller final : public Installer {
 public:
-    bool ok = true;
+    bool ok = true;              ///< o código de saída do cliente
+    bool writes = true;          ///< o daemon escreve o slot nesta chamada
+    std::string fail_reason;     ///< o `LastError` que o daemon fica depois
+    bool busy_after = false;     ///< o daemon segue escrevendo depois do cliente sair
     std::string expected = kBundle;
     std::vector<std::string> bundles;
+    RaucDaemon state{RaucDaemon::Operation::Idle, ""};
+    std::optional<RaucSlotRecord> record;
+    std::function<std::int64_t()> clock;
+
     bool install(const std::string& bundle, std::string& message, const KeepGoing&) override
     {
         bundles.push_back(bundle);
         std::string text;
         fs::read_file(bundle, text);
         EXPECT_EQ(text, expected);
+        if (writes) {
+            write_slot();
+        }
+        if (!fail_reason.empty()) {
+            state.last_error = fail_reason;
+        }
+        if (busy_after) {
+            state.operation = RaucDaemon::Operation::Busy;
+        }
         if (!ok) {
-            message = "rauc install saiu com 1: signature verification failed";
+            message = fail_reason.empty()
+                          ? "rauc install saiu com 2: D-Bus error while installing `x.raucb`"
+                          : "rauc install saiu com 1: Installing `x.raucb` failed";
         }
         return ok;
+    }
+    RaucDaemon daemon() override { return state; }
+    std::optional<RaucSlotRecord> slot(const std::string&) override
+    {
+        EXPECT_EQ(state.operation, RaucDaemon::Operation::Idle) << "GetSlotStatus com o daemon ocupado";
+        return record;
+    }
+    void write_slot()
+    {
+        RaucSlotRecord r;
+        r.status = "ok";
+        r.build = "20260927202307";
+        r.installed_ms = clock ? clock() : 0;
+        r.primary = true;
+        record = r;
     }
 };
 
@@ -140,6 +178,7 @@ protected:
                ::testing::UnitTest::GetInstance()->current_test_info()->name() + "-" +
                std::to_string(::getpid());
         paths = Engine::Paths::under(root, root + "/keys");
+        installer.clock = [this] { return platform.wall; };
         wipe();
         fs::make_dirs(paths.inbox);
     }
@@ -353,6 +392,8 @@ TEST_F(Ota, RaucRecusouViraInstallFailedSemRetry)
 {
     platform.wall = 1790590000000LL;
     installer.ok = false;
+    installer.writes = false;
+    installer.fail_reason = "signature verification failed";
     deliver(manifest());
     engine()->tick();
     const auto ev = drain();
@@ -361,8 +402,130 @@ TEST_F(Ota, RaucRecusouViraInstallFailedSemRetry)
     EXPECT_EQ(ev.back()["args"]["code"], "RAUC_INSTALL_FAILED");
     EXPECT_EQ(ev.back()["args"]["retryable"], false);
     EXPECT_NE(ev.back()["args"]["message"].get<std::string>().find("signature"), std::string::npos);
+    EXPECT_EQ(installer.bundles.size(), 1u) << "o bundle recusado não é mandado de novo";
     EXPECT_EQ(platform.reboots, 0);
     EXPECT_TRUE(fs::list(paths.download, "").empty());
+}
+
+TEST_F(Ota, LastErrorAntigoDoDaemonNaoEhMotivo)
+{
+    // O LastError fica de uma falha anterior (desde que o daemon subiu): só o
+    // que mudou durante esta instalação conta.
+    platform.wall = 1790590000000LL;
+    installer.state.last_error = "falha de uma instalação de ontem";
+    installer.ok = false;
+    installer.writes = false;
+    deliver(manifest());
+    engine()->tick();
+    const auto ev = drain();
+    ASSERT_EQ(ev.back()["code"], "ota-failed");
+    EXPECT_EQ(ev.back()["args"]["retryable"], true);
+    EXPECT_EQ(installer.bundles.size(), 2u);
+}
+
+TEST_F(Ota, ClienteCaiuMasODaemonInstalouSegueParaOReboot)
+{
+    // O cliente sai com 2 ("D-Bus error"), o daemon escreveu o slot: vale o
+    // daemon (OTA-00095, 26/11/2026).
+    platform.wall = 1790590000000LL;
+    installer.ok = false;
+    deliver(manifest());
+    engine()->tick();
+    const auto ev = drain();
+    EXPECT_EQ(codes(ev), (std::vector<std::string>{"ota-download-started", "ota-download-completed",
+                                                    "ota-verified", "ota-install-started",
+                                                    "ota-installed", "ota-rebooting"}));
+    EXPECT_EQ(ev[4]["args"]["confirmedBy"], "rauc-status");
+    EXPECT_EQ(ev[4]["args"]["slot"], "B");
+    EXPECT_EQ(installer.bundles.size(), 1u);
+    EXPECT_EQ(platform.reboots, 1);
+}
+
+TEST_F(Ota, AgenteVoltouComORaucEscrevendoEsperaSemMandarOutro)
+{
+    // O agente cai no meio: o cliente morre, o rauc.service segue escrevendo.
+    platform.wall = 1790590000000LL;
+    installer.ok = false;
+    installer.writes = false;
+    installer.busy_after = true;
+    deliver(manifest());
+    engine()->tick();
+    EXPECT_EQ(stage(), Stage::Installing);
+    EXPECT_EQ(codes(drain()).back(), "ota-install-started");
+
+    // O processo novo lê o estado: o daemon ainda está ocupado.
+    engine()->tick();
+    EXPECT_EQ(stage(), Stage::Installing);
+    EXPECT_TRUE(drain().empty());
+    EXPECT_EQ(installer.bundles.size(), 1u) << "mandou outro rauc install com o daemon ocupado";
+
+    // O daemon termina a escrita que começou antes da queda.
+    platform.wall += 6 * 60 * 1000;
+    installer.write_slot();
+    installer.state.operation = RaucDaemon::Operation::Idle;
+    engine()->tick();
+    EXPECT_EQ(codes(drain()), (std::vector<std::string>{"ota-installed", "ota-rebooting"}));
+    EXPECT_EQ(installer.bundles.size(), 1u);
+    EXPECT_EQ(platform.reboots, 1);
+}
+
+TEST_F(Ota, SlotDeUmaInstalacaoAnteriorNaoContaComoEscrito)
+{
+    // O slot alvo está `ok` e primário, mas de antes do install-started.
+    platform.wall = 1790590000000LL;
+    installer.write_slot();
+    installer.record->installed_ms = platform.wall - 3600 * 1000;
+    installer.ok = false;
+    installer.writes = false;
+    deliver(manifest());
+    engine()->tick();
+    const auto ev = drain();
+    ASSERT_EQ(ev.back()["code"], "ota-failed");
+    EXPECT_EQ(platform.reboots, 0);
+}
+
+TEST_F(Ota, SemMotivoDoDaemonTentaMaisUmaVezEFalhaComRetry)
+{
+    platform.wall = 1790590000000LL;
+    installer.ok = false;
+    installer.writes = false;
+    deliver(manifest());
+    engine()->tick();
+    const auto ev = drain();
+    ASSERT_EQ(ev.back()["code"], "ota-failed");
+    EXPECT_EQ(ev.back()["args"]["code"], "RAUC_INSTALL_FAILED");
+    EXPECT_EQ(ev.back()["args"]["retryable"], true);
+    EXPECT_NE(ev.back()["args"]["message"].get<std::string>().find("D-Bus error"), std::string::npos);
+    EXPECT_EQ(installer.bundles.size(), 2u);
+    EXPECT_EQ(platform.reboots, 0);
+}
+
+TEST_F(Ota, SegundaVoltaSemMotivoQueEscreveSegue)
+{
+    // O primeiro cliente caiu antes do daemon aceitar; o segundo instala.
+    platform.wall = 1790590000000LL;
+    installer.ok = false;
+    installer.writes = false;
+    deliver(manifest());
+    // Depois da primeira chamada o cliente passa a funcionar.
+    struct Flip final : Installer {
+        FakeInstaller& inner;
+        explicit Flip(FakeInstaller& i) : inner(i) {}
+        bool install(const std::string& b, std::string& m, const KeepGoing& k) override
+        {
+            const bool r = inner.install(b, m, k);
+            inner.ok = true;
+            inner.writes = true;
+            return r;
+        }
+        RaucDaemon daemon() override { return inner.daemon(); }
+        std::optional<RaucSlotRecord> slot(const std::string& n) override { return inner.slot(n); }
+    } flip(installer);
+    Engine engine2(paths, downloader, platform, sink);
+    engine2.add_handler(std::make_unique<RaucHandler>(flip));
+    engine2.tick();
+    EXPECT_EQ(codes(drain()).back(), "ota-rebooting");
+    EXPECT_EQ(installer.bundles.size(), 2u);
 }
 
 TEST_F(Ota, BootForaDeUmSlotNaoInstala)
@@ -503,11 +666,14 @@ TEST_F(Ota, ReentregaDuranteOItemNaoAbreOutroEDepoisDoFimAbre)
 
     // Termina com falha; o retry do backend (mesmo id) abre uma tentativa nova.
     installer.ok = false;
+    installer.writes = false;
+    installer.fail_reason = "signature verification failed";
     platform.wall += Engine::backoff_ms(1);
     e->tick();
     EXPECT_FALSE(has_state());
     drain();
     installer.ok = true;
+    installer.writes = true;
     deliver(manifest());
     e->tick();
     EXPECT_EQ(stage(), Stage::Rebooting);
